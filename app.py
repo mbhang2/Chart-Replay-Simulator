@@ -5,15 +5,21 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from shiny import App, reactive, render, ui
+from ta.volatility import BollingerBands
 
 
 df = dp.to_df("./NQ_tick_data/December_247.txt", to_timestamp=False)
 dp.convert_datetime(df)
 df.set_index("Time", inplace=True)
 
+indicator_bb = BollingerBands(close=df["Close"], window=20, window_dev=2)
+df['bb_bbm'] = indicator_bb.bollinger_mavg()
+df['bb_bbh'] = indicator_bb.bollinger_hband()
+df['bb_bbl'] = indicator_bb.bollinger_lband()
+
 current_bar = 0
 capital = 100000
-position = 0.0
+position = 0
 
 buy_price=[]
 sell_price=[]
@@ -77,10 +83,11 @@ app_ui = ui.page_fluid(
             width=2
         ),
         ui.panel_main(
-            ui.output_plot("plot", '1200px', '720px')
+            ui.output_plot("plot", '1000px', '600px'),
         )
     ),
     ui.row(
+        ui.input_radio_buttons("bb", "볼린저밴드", {True: "On", False: "Off"}, selected=False),
         ui.input_text("skip", "첫 봉 번호", "3000"),
         ui.input_text("bars_to_show", "차트 봉 개수", "100"),
         ui.input_action_button("forward", "다음 봉"),
@@ -115,13 +122,23 @@ def server(input, output, session):
         fig = mpf.figure(figsize=(12,9))
         ax = fig.add_subplot(1,1,1)
 
-        tcdf = df['CL']
-        apd  = mpf.make_addplot(tcdf, ax=ax)
+        start = int(int(input.skip())+input.forward())
+        end = int(int(input.skip())+input.forward()+int(input.bars_to_show())+1)
 
         market_colors = mpf.make_marketcolors(up = 'red', down = 'blue')
         custom_style = mpf.make_mpf_style(marketcolors = market_colors, facecolor='white', figcolor='white', gridstyle='')
 
-        mpf.plot(df[int(input.skip())+input.forward():int(input.skip())+input.forward()+int(input.bars_to_show())+1], volume=False, ax=ax, type='candle', style=custom_style, mav=(20))
+        tcdf = []
+        apd = None
+
+        if not input.bb():
+            tcdf = df[['bb_bbh', 'bb_bbl', 'bb_bbm']][start:end]
+            apd  = mpf.make_addplot(tcdf, ax=ax)
+
+            mpf.plot(df[start:end], volume=False, ax=ax, type='candle', style=custom_style, addplot=apd)
+
+        else:
+            mpf.plot(df[start:end], volume=False, ax=ax, type='candle', style=custom_style)
 
         return fig
     
@@ -138,7 +155,7 @@ def server(input, output, session):
         return f""
     
     @render.text
-    @reactive.event(input.buy, input.sell, input.reset, ignore_none=False)
+    @reactive.event(input.buy, input.sell, ignore_none=False)
     def avg_price():
         net_pos = len(buy_price)-len(sell_price)
 
@@ -148,19 +165,22 @@ def server(input, output, session):
         return f"{round(np.average(buy_price[-abs(net_pos):]) if net_pos > 0 else np.average(sell_price[-abs(net_pos):]), 2)}"
     
     @render.text
-    @reactive.event(input.buy, input.sell, input.reset, ignore_none=False)
+    @reactive.event(input.buy, input.sell, ignore_none=False, ignore_init=False)
     def net_position():
         net_pos = len(buy_price)-len(sell_price)
 
         return f"{net_pos}"
         
     @render.text
-    @reactive.event(input.forward, input.reset, ignore_none=False)
+    @reactive.event(input.forward, ignore_none=False, ignore_init=False)
     def compute_capital():
         net_pos = len(buy_price)-len(sell_price)
         min_len = min(len(buy_price), len(sell_price))
         realized_pnl = 0
         unrealized_pnl = 0
+
+        if min_len == 0:
+            return f"${capital}"
         
         for i in range(min_len):
             realized_pnl += (sell_price[i] - buy_price[i])*20
@@ -168,13 +188,14 @@ def server(input, output, session):
         if net_pos == 0:
             unrealized_pnl = 0
         
-        curr_price = df["Close"][int(input.skip())+input.forward()+int(input.bars_to_show())]
-        avg_price = np.average(buy_price[-abs(net_pos):]) if net_pos > 0 else np.average(sell_price[-abs(net_pos):])
-
-        if net_pos > 0:
-            unrealized_pnl = (curr_price-avg_price)*20*abs(net_pos)
         else:
-            unrealized_pnl = (-curr_price+avg_price)*20*abs(net_pos)
+            curr_price = df["Close"][int(input.skip())+input.forward()+int(input.bars_to_show())]
+            avg_price = np.average(buy_price[-abs(net_pos):]) if net_pos > 0 else np.average(sell_price[-abs(net_pos):])
+
+            if net_pos > 0:
+                unrealized_pnl = (curr_price-avg_price)*20*abs(net_pos)
+            else:
+                unrealized_pnl = (-curr_price+avg_price)*20*abs(net_pos)
 
         to_return = round(capital + realized_pnl + unrealized_pnl,2)
 
@@ -184,7 +205,7 @@ def server(input, output, session):
             return f"-${abs(to_return):,}"
         
     @render.text
-    @reactive.event(input.buy, input.sell, input.forward, input.reset, ignore_none=False)
+    @reactive.event(input.buy, input.sell, input.forward, ignore_none=False, ignore_init=False)
     def compute_total_pnl():
         min_len = min(len(buy_price), len(sell_price))
         realized_pnl = 0
@@ -214,14 +235,12 @@ def server(input, output, session):
             return f"-${abs(total_pnl):,}"
         
     @render.text
-    @reactive.event(input.forward, input.buy, input.sell, input.reset, ignore_none=False)
+    @reactive.event(input.forward, input.buy, input.sell, ignore_none=False, ignore_init=False)
     def compute_unrealized_pnl():
         net_pos = len(buy_price)-len(sell_price)
-        realized_pnl = 0
         unrealized_pnl = 0
 
         if net_pos == 0:
-            unrealized_pnl = 0
             return f"${unrealized_pnl}"
         
         curr_price = df["Close"][int(input.skip())+input.forward()+int(input.bars_to_show())]
